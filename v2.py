@@ -67,10 +67,18 @@ class MultiHeadAttention(nn.Module):
         # self.key = nn.Linear(n_embd, n_embd, bias=False)
         # self.query = nn.Linear(n_embd, n_embd, bias=False)
         # self.value = nn.Linear(n_embd, n_embd, bias=False)
+
+        # check if flash attention can be used
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0") 
+        # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones((1, 1, block_size, block_size))))
-        self.ln = nn.LayerNorm(n_embd)
-        self.dropout = nn.Dropout(0.2)
+        self.attn_dropout = nn.Dropout(0.2)
+        # output projection
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.proj_dropout = nn.Dropout(0.2)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -78,15 +86,24 @@ class MultiHeadAttention(nn.Module):
         q = q.view(B, T, n_head, C // n_head).transpose(1, 2)   # (B, nh, T, hs)
         k = k.view(B, T, n_head, C // n_head).transpose(1, 2)   # (B, nh, T, hs)
         v = v.view(B, T, n_head, C // n_head).transpose(1, 2)   # (B, nh, T, hs)
-        wei = q @ k.transpose(2, 3) * k.size()[-1]**-0.5
-        wei = wei.masked_fill(self.tril[:, :, :T, :T] == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1) # (B, h, T, T)
-        wei = self.dropout(wei)
-        # apply the attention weights to the values
-        # (B, nh, T, T) @ (B, nh, T, hs) -> (B, h, T, hs)
-        out = wei @ v
+        if self.flash:
+            tmp_mask  = self.tril
+            attn_mask = tmp_mask.masked_fill(tmp_mask==0, float('-inf'))[:, :, :T, :T]
+            #  input: q, k, v need to be [B, nh, T, hs]
+            #  return attn_weight @ value  -> [B, nh, T, hs]
+            #  flash attn do the scale dot product only
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.2, is_causal=False)
+        else:   
+            wei = q @ k.transpose(2, 3) * k.size()[-1]**-0.5
+            wei = wei.masked_fill(self.tril[:, :, :T, :T] == 0, float('-inf'))
+            wei = F.softmax(wei, dim=-1) # (B, h, T, T)
+            wei = self.attn_dropout(wei)
+            # apply the attention weights to the values
+            # (B, nh, T, T) @ (B, nh, T, hs) -> (B, h, T, hs)
+            out = wei @ v
+
         out = out.transpose(1, 2).contiguous().view(B, T, C) # (B, T, C)
-        out = self.ln(out)
+        out = self.proj_dropout(self.c_proj(out))
         return out
     
 class FeedFoward(nn.Module):
@@ -94,7 +111,7 @@ class FeedFoward(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, n_embd * 4),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(n_embd * 4, n_embd),
             nn.Dropout(0.2)
         )
