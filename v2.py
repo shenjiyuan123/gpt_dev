@@ -3,14 +3,15 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 64 # how many independent sequences will we process in parallel?
-block_size = 256 # what is the maximum context length for predictions?
+batch_size = 32 # how many independent sequences will we process in parallel?
+block_size = 8 # what is the maximum context length for predictions?
 max_iters = 3000
-eval_interval = 300
-learning_rate = 1e-2
+eval_interval = 500
+learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 32
+n_head = 4
 # ------------
 
 torch.manual_seed(1337)
@@ -58,6 +59,63 @@ def estimate_loss():
     model.train()
     return out
 
+class MultiHeadAttention(nn.Module):
+
+    def __init__(self) -> None:
+        super().__init__()
+        # self.key = nn.Linear(n_embd, n_embd, bias=False)
+        # self.query = nn.Linear(n_embd, n_embd, bias=False)
+        # self.value = nn.Linear(n_embd, n_embd, bias=False)
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones((1, 1, block_size, block_size))))
+        self.ln = nn.LayerNorm(n_embd)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        q, k, v = self.c_attn(x).split(n_embd, dim=-1)
+        q = q.view(B, T, n_head, C // n_head).transpose(1, 2)   # (B, nh, T, hs)
+        k = k.view(B, T, n_head, C // n_head).transpose(1, 2)   # (B, nh, T, hs)
+        v = v.view(B, T, n_head, C // n_head).transpose(1, 2)   # (B, nh, T, hs)
+        wei = q @ k.transpose(2, 3) * k.size()[-1]**-0.5
+        wei = wei.masked_fill(self.tril[:, :, :T, :T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1) # (B, h, T, T)
+        wei = self.dropout(wei)
+        # apply the attention weights to the values
+        # (B, nh, T, T) @ (B, nh, T, hs) -> (B, h, T, hs)
+        out = wei @ v
+        out = out.transpose(1, 2).contiguous().view(B, T, C) # (B, T, C)
+        out = self.ln(out)
+        return out
+    
+class FeedFoward(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, n_embd * 4),
+            nn.ReLU(),
+            nn.Linear(n_embd * 4, n_embd),
+            nn.Dropout(0.2)
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(n_embd)
+        self.attn = MultiHeadAttention()
+        self.ln_2 = nn.LayerNorm(n_embd)
+        self.ffwd = FeedFoward()
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.ffwd(self.ln_2(x))
+        return x
+    
+
+
 # super simple bigram model
 class BigramLanguageModel(nn.Module):
 
@@ -66,6 +124,7 @@ class BigramLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.blk = Block()
         self.lm_head = nn.Linear(n_embd, vocab_size)
     
 
@@ -75,7 +134,8 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
         x = tok_emb + pos_emb # (B,T,C)
-        logits = self.lm_head(x) # (B,T,vocab_size)
+        x = self.blk(x) # (B,T,C)
+        logits = self.lm_head(x)
 
         if targets is None:
             loss = None
@@ -90,8 +150,10 @@ class BigramLanguageModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
+            # crop the context to the last block_size tokens
+            idx_conf = idx[:, -block_size:]
             # get the predictions
-            logits, loss = self(idx)
+            logits, loss = self(idx_conf)
             # focus only on the last time step
             logits = logits[:, -1, :] # becomes (B, C)
             # apply softmax to get probabilities
