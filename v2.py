@@ -12,6 +12,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 32
 n_head = 4
+n_layer = 4
 # ------------
 
 torch.manual_seed(1337)
@@ -117,14 +118,16 @@ class Block(nn.Module):
 
 
 # super simple bigram model
-class BigramLanguageModel(nn.Module):
+class GPT2(nn.Module):
 
     def __init__(self):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blk = Block()
+        # Block = [b1, b2, b3..]
+        # python lists are not registered in a nn.Module
+        self.blk = nn.Sequential(*[Block() for _ in range(n_layer)])
         self.lm_head = nn.Linear(n_embd, vocab_size)
     
 
@@ -164,7 +167,7 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
 
-model = BigramLanguageModel()
+model = GPT2()
 m = model.to(device)
 
 # create a PyTorch optimizer
